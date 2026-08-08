@@ -25,8 +25,8 @@ export interface SwitchStoreOpts {
 
 /**
  * Troca o contexto da loja no painel Saipos.
- * Se já estiver na loja alvo (header), pula a troca.
- * Senão abre o modal, localiza a linha pelo ID e clica na seta.
+ * Botão válido = disabled===false e ng-click contém "changeCurrentStore"
+ * (texto vazio é normal — é só o ícone zmdi-arrow-right).
  */
 export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<void> {
   const { lojaId, nomeNaTabela } = opts;
@@ -34,20 +34,23 @@ export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<vo
 
   await dismissAlreadyConnectedModal(page);
 
-  // 1) Já estamos no contexto certo? Não abre modal.
-  if (nomeNaTabela) {
-    const current = await readCurrentStoreFromHeader(page);
-    if (current && storeIdentityMatches(current, nomeNaTabela, lojaId)) {
-      log.info(
-        'switchStore',
-        `Já no contexto da loja alvo — pulando troca (header="${current.display}")`,
-        current,
-      );
-      return;
-    }
-    if (current) {
-      log.info('switchStore', `Loja atual no header: "${current.display}" — precisa trocar`, current);
-    }
+  const headerBefore = await readCurrentStoreFromHeader(page);
+
+  // Já no contexto certo? Não abre modal.
+  if (nomeNaTabela && headerBefore && storeIdentityMatches(headerBefore, nomeNaTabela, lojaId)) {
+    log.info(
+      'switchStore',
+      `Já no contexto da loja alvo — pulando troca (header="${headerBefore.display}")`,
+      headerBefore,
+    );
+    return;
+  }
+  if (headerBefore) {
+    log.info(
+      'switchStore',
+      `Loja atual no header: "${headerBefore.display}" — precisa trocar`,
+      headerBefore,
+    );
   }
 
   const opened = await openStoreModal(page);
@@ -77,48 +80,69 @@ export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<vo
       const idStr = String(id);
       const rows = Array.from(document.querySelectorAll('tr'));
 
-      const clickArrow = (row: Element): { via: string; hadButton: boolean } => {
-        const arrow =
-          row.querySelector(
-            'button, a.btn, a[ng-click], button[ng-click], button.md-icon-button',
-          ) ||
-          row.querySelector(
-            'i.fa-arrow-right, i.fa-chevron-right, .fa-arrow-right, .glyphicon-arrow-right',
-          );
-        if (arrow) {
-          const target =
-            (arrow.closest('button, a') as HTMLElement | null) || (arrow as HTMLElement);
-          target.click();
-          return { via: 'arrow', hadButton: true };
+      /**
+       * Botão selecionável: disabled===false e ng-click com changeCurrentStore.
+       * text === '' é NORMAL (ícone zmdi-arrow-right) — não rejeitar por isso.
+       */
+      const findSelectButton = (row: Element): HTMLButtonElement | null => {
+        const buttons = Array.from(row.querySelectorAll('button'));
+        for (const btn of buttons) {
+          const ngClick = btn.getAttribute('ng-click') || '';
+          if (btn.disabled) continue;
+          if (!/changeCurrentStore/i.test(ngClick)) continue;
+          return btn;
         }
-        (row as HTMLElement).click();
-        return { via: 'row-click-fallback', hadButton: false };
+        // Fallback: botão com ícone de seta (mesmo sem ng-click legível)
+        for (const btn of buttons) {
+          if (btn.disabled) continue;
+          if (btn.querySelector('i.zmdi-arrow-right, i.zmdi.zmdi-arrow-right')) {
+            return btn;
+          }
+        }
+        return null;
       };
 
-      // 1) Por ID na coluna
+      const tryRow = (
+        row: Element,
+        via: string,
+      ): { ok: true; via: string } | null => {
+        const btn = findSelectButton(row);
+        if (!btn) return null;
+        btn.click();
+        return { ok: true, via };
+      };
+
+      // 1) Por ID
       for (const row of rows) {
         const cells = Array.from(row.querySelectorAll('td'));
         if (cells.length === 0) continue;
-        const texts = cells.map((c) => (c.textContent || '').trim());
-        if (texts.some((t) => t === idStr)) {
-          const r = clickArrow(row);
-          return { ok: true, via: `id:${r.via}`, hadButton: r.hadButton };
-        }
+        const texts = cells.map((c) => (c.textContent || '').replace(/\s+/g, ' ').trim());
+        if (!texts.some((t) => t === idStr || t.includes(idStr))) continue;
+        const result = tryRow(row, 'id:changeCurrentStore');
+        if (result) return result;
+        return {
+          ok: false,
+          via: 'id-row-found-but-no-valid-button',
+        };
       }
 
-      // 2) Por nome na tabela
+      // 2) Por nome
       if (nome) {
         const nomeNorm = nome.toLowerCase();
         for (const row of rows) {
+          if (!row.querySelector('td')) continue;
           const rowText = (row.textContent || '').toLowerCase();
           if (!rowText.includes(nomeNorm)) continue;
-          if (!row.querySelector('td')) continue;
-          const r = clickArrow(row);
-          return { ok: true, via: `nome:${r.via}`, hadButton: r.hadButton };
+          const result = tryRow(row, 'nome:changeCurrentStore');
+          if (result) return result;
+          return {
+            ok: false,
+            via: 'nome-row-found-but-no-valid-button',
+          };
         }
       }
 
-      return { ok: false, via: '', hadButton: false };
+      return { ok: false, via: 'row-not-found' };
     },
     lojaId,
     nomeNaTabela ?? null,
@@ -128,27 +152,19 @@ export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<vo
     const dump = await dumpMatchingRow(page, lojaId, nomeNaTabela);
     log.error(
       'switchStore',
-      `Loja não selecionável no modal. Dump da linha (ID=${lojaId}):`,
+      `Falha ao clicar changeCurrentStore (via=${clicked.via}). Dump:`,
       dump,
     );
     throw new Error(
       `switchStore: loja ID=${lojaId}` +
         (nomeNaTabela ? ` / nome="${nomeNaTabela}"` : '') +
-        ' não encontrada/selecionável no modal. ' +
-        `Dump da linha: ${dump.summary}`,
+        ` não selecionável (via=${clicked.via}). Dump: ${dump.summary}`,
     );
   }
 
-  if (!clicked.hadButton) {
-    log.warn(
-      'switchStore',
-      'Linha encontrada sem botão de seta — cliquei na linha inteira (fallback). ' +
-        'Se a loja atual não tiver seta por já estar selecionada, o skip do header deveria ter pegado isso.',
-    );
-  }
+  log.info('switchStore', `Clique no botão changeCurrentStore via ${clicked.via}`);
 
-  log.info('switchStore', `Loja selecionada via ${clicked.via}`);
-
+  // Espera modal fechar
   await page
     .waitForFunction(
       () => {
@@ -158,11 +174,72 @@ export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<vo
       { timeout: config.selectorTimeoutMs },
     )
     .catch(() => {
-      log.warn('switchStore', 'Modal ainda visível após seleção — continuando');
+      log.warn('switchStore', 'Modal ainda visível após clique — continuando validação do header');
     });
 
-  await sleep(1500);
-  log.info('switchStore', `Contexto da loja ${lojaId} ativo`);
+  // Valida que a troca realmente aconteceu
+  await sleep(1000);
+  const headerAfter = await waitForStoreSwitch(
+    page,
+    nomeNaTabela,
+    lojaId,
+    headerBefore,
+  );
+
+  log.info('switchStore', `Contexto da loja ${lojaId} ativo`, {
+    before: headerBefore?.display,
+    after: headerAfter?.display,
+  });
+}
+
+/**
+ * Espera o header refletir a loja alvo (ou pelo menos mudar em relação ao before).
+ */
+async function waitForStoreSwitch(
+  page: Page,
+  nomeNaTabela: string | undefined,
+  lojaId: number,
+  before: HeaderStoreInfo | null,
+): Promise<HeaderStoreInfo | null> {
+  const deadline = Date.now() + Math.min(config.selectorTimeoutMs, 20_000);
+
+  while (Date.now() < deadline) {
+    const current = await readCurrentStoreFromHeader(page);
+    if (current) {
+      if (nomeNaTabela && storeIdentityMatches(current, nomeNaTabela, lojaId)) {
+        log.info(
+          'switchStore',
+          `Header confirma loja alvo: "${current.display}"`,
+          current,
+        );
+        return current;
+      }
+
+      // Se não dá pra confirmar pelo sufixo (header abreviado), aceita mudança de texto
+      const beforeDisp = before?.display ?? '';
+      if (
+        current.display &&
+        !/selecionar loja/i.test(current.display) &&
+        current.display !== beforeDisp
+      ) {
+        log.info(
+          'switchStore',
+          `Header mudou de "${beforeDisp}" → "${current.display}" (troca aceita)`,
+          current,
+        );
+        return current;
+      }
+    }
+    await sleep(400);
+  }
+
+  const finalHeader = await readCurrentStoreFromHeader(page);
+  log.warn(
+    'switchStore',
+    'Não confirmei mudança clara no header após changeCurrentStore — seguindo mesmo assim',
+    { before, after: finalHeader },
+  );
+  return finalHeader;
 }
 
 interface HeaderStoreInfo {
@@ -172,9 +249,6 @@ interface HeaderStoreInfo {
   rawText: string;
 }
 
-/**
- * Lê o botão/nome da loja atual no header (texto abreviado, title, aria-label).
- */
 async function readCurrentStoreFromHeader(page: Page): Promise<HeaderStoreInfo | null> {
   return page.evaluate(() => {
     const candidates = Array.from(
@@ -185,7 +259,6 @@ async function readCurrentStoreFromHeader(page: Page): Promise<HeaderStoreInfo |
       const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
       if (!text || text.length > 60) continue;
 
-      // "SELECIONAR LOJA" = nenhuma loja ativa ainda
       if (/selecionar loja/i.test(text)) {
         return {
           display: text,
@@ -209,7 +282,6 @@ async function readCurrentStoreFromHeader(page: Page): Promise<HeaderStoreInfo |
 
       if (!looksLike || el.offsetParent === null) continue;
 
-      // Preferir o elemento clicável do header com atributos mais ricos
       const clickable =
         (el.closest('button, a, [ng-click], [ui-sref]') as HTMLElement | null) || el;
 
@@ -224,10 +296,6 @@ async function readCurrentStoreFromHeader(page: Page): Promise<HeaderStoreInfo |
   });
 }
 
-/**
- * Compara header atual com a loja alvo.
- * Não aceita só "Calenzano"/"CALENZA..." — exige o sufixo distintivo (Ahu, Portão…).
- */
 function storeIdentityMatches(
   current: HeaderStoreInfo,
   nomeNaTabela: string,
@@ -240,27 +308,18 @@ function storeIdentityMatches(
   );
   const target = normalize(nomeNaTabela);
 
-  // Nome completo no title/aria/texto
   if (haystack.includes(target)) return true;
-
-  // ID explícito em algum atributo/texto
   if (haystack.includes(String(lojaId))) return true;
 
-  // Sufixo distintivo após " - " (ex: "Ahu", "Pilarzinho", "Portão", "Uberaba")
   const suffix = nomeNaTabela.includes(' - ')
     ? nomeNaTabela.split(' - ').slice(1).join(' - ')
     : nomeNaTabela;
   const suffixNorm = normalize(suffix);
   if (suffixNorm.length >= 3 && haystack.includes(suffixNorm)) return true;
 
-  // Texto abreviado: só conta se o sufixo distintivo aparecer nele
-  // ( "CALENZA..." sozinho NÃO identifica a loja )
   return false;
 }
 
-/**
- * Quando a seleção falha: captura HTML/texto da linha do ID (ou do nome) no modal.
- */
 async function dumpMatchingRow(
   page: Page,
   lojaId: number,
@@ -278,11 +337,9 @@ async function dumpMatchingRow(
         const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
         allRowTexts.push(text);
 
-        const cellTexts = cells.map((c) => (c.textContent || '').trim());
-        const byId = cellTexts.some((t) => t === idStr);
-        const byNome = nome
-          ? text.toLowerCase().includes(nome.toLowerCase())
-          : false;
+        const cellTexts = cells.map((c) => (c.textContent || '').replace(/\s+/g, ' ').trim());
+        const byId = cellTexts.some((t) => t === idStr || t.includes(idStr));
+        const byNome = nome ? text.toLowerCase().includes(nome.toLowerCase()) : false;
 
         if (byId || byNome) {
           const buttons = Array.from(row.querySelectorAll('button, a')).map((b) => ({
@@ -291,6 +348,9 @@ async function dumpMatchingRow(
             className: (b as HTMLElement).className,
             ngClick: b.getAttribute('ng-click') || '',
             disabled: (b as HTMLButtonElement).disabled === true,
+            selectable:
+              !(b as HTMLButtonElement).disabled &&
+              /changeCurrentStore/i.test(b.getAttribute('ng-click') || ''),
           }));
 
           const html = (row as HTMLElement).outerHTML.slice(0, 4000);
@@ -299,14 +359,7 @@ async function dumpMatchingRow(
             `buttons=${JSON.stringify(buttons)} ` +
             `html=${html.slice(0, 800)}`;
 
-          return {
-            found: true,
-            text,
-            html,
-            summary,
-            allRowTexts,
-            buttons,
-          };
+          return { found: true, text, html, summary, allRowTexts, buttons };
         }
       }
 
@@ -315,13 +368,7 @@ async function dumpMatchingRow(
         (nome ? ` nem nome="${nome}"` : '') +
         `. Linhas vistas (${allRowTexts.length}): ${allRowTexts.slice(0, 8).join(' || ')}`;
 
-      return {
-        found: false,
-        text: '',
-        html: '',
-        summary,
-        allRowTexts,
-      };
+      return { found: false, text: '', html: '', summary, allRowTexts };
     },
     lojaId,
     nomeNaTabela ?? null,
