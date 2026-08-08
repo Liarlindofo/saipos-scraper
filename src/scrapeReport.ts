@@ -67,6 +67,7 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
           await switchStore(page, {
             lojaId: store.id,
             nomeNaTabela: store.nomeNaTabela,
+            cnpj: store.cnpj,
           });
           await goToSalesByPeriodReport(page);
           await setDateRange(page, req.data, req.data);
@@ -87,6 +88,7 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
             await switchStore(page, {
               lojaId: store.id,
               nomeNaTabela: store.nomeNaTabela,
+              cnpj: store.cnpj,
             });
             await goToSalesByPeriodReport(page);
             await setDateRange(page, req.data, req.data);

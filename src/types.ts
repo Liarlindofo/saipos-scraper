@@ -28,4 +28,6 @@ export interface StoreDef {
   id: number;
   /** Texto na coluna Nome do modal (ex: "Calenzano - Ahu") */
   nomeNaTabela: string;
+  /** CNPJ como aparece na tabela do modal — usado pra confirmar troca */
+  cnpj: string;
 }

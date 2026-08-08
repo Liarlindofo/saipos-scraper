@@ -21,6 +21,8 @@ export interface SwitchStoreOpts {
   lojaId: number;
   /** Ex: "Calenzano - Ahu" — fallback se o ID não aparecer na tabela */
   nomeNaTabela?: string;
+  /** CNPJ da loja (confirmação pós-troca — o header truncado NÃO serve) */
+  cnpj?: string;
 }
 
 /**
@@ -243,31 +245,43 @@ async function waitAndClickStoreButton(
  * Um único caminho pra achar/clicar o botão (waitAndClickStoreButton).
  */
 export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<void> {
-  const { lojaId, nomeNaTabela } = opts;
-  log.info('switchStore', `Trocando para loja ID=${lojaId}`, { nomeNaTabela });
+  const { lojaId, nomeNaTabela, cnpj } = opts;
+  log.info('switchStore', `Trocando para loja ID=${lojaId}`, { nomeNaTabela, cnpj });
 
   await dismissAlreadyConnectedModal(page);
-  await sleep(800); // header Angular pode demorar um frame a pintar
+  await sleep(400);
 
-  const headerBefore = await readCurrentStoreFromHeader(page);
-
-  if (nomeNaTabela && headerBefore && storeIdentityMatches(headerBefore, nomeNaTabela, lojaId)) {
-    log.info(
-      'switchStore',
-      `Já no contexto da loja alvo — pulando troca (header="${headerBefore.display}")`,
-      headerBefore,
-    );
-    return;
-  }
-  if (headerBefore) {
-    log.info(
-      'switchStore',
-      `Loja atual no header: "${headerBefore.display}" — precisa trocar`,
-      headerBefore,
-    );
+  // Skip só com evidência forte (Angular id ou title/aria).
+  // NUNCA pular por CNPJ solto no body — na home aparecem CNPJs de várias lojas.
+  const needsStore = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('button, a')).some((el) =>
+      /^selecionar loja$/i.test((el.textContent || '').replace(/\s+/g, ' ').trim()),
+    ),
+  );
+  if (!needsStore) {
+    const already = await readCurrentStoreIdentity(page);
+    const strong =
+      already &&
+      (already.source.startsWith('angular') || already.source.startsWith('attr')) &&
+      identityMatchesTarget(already, lojaId, nomeNaTabela, cnpj);
+    if (strong) {
+      log.info('switchStore', `Já no contexto da loja alvo — pulando troca`, already);
+      return;
+    }
+    if (already) {
+      log.info('switchStore', 'Loja atual detectada — precisa trocar', already);
+    }
   } else {
-    log.warn('switchStore', 'Header da loja não identificado — tentando abrir modal mesmo assim');
+    log.info('switchStore', 'Header "SELECIONAR LOJA" — troca obrigatória');
   }
+
+  // Home tem o seletor mais estável; na página do relatório "Calenza..."
+  // frequentemente abre o menu operacional (frente de caixa) em vez do modal.
+  await page.evaluate(() => {
+    window.location.hash = '#/app/home';
+  });
+  await sleep(900);
+  await dismissOverlays(page);
 
   const opened = await openStoreModal(page);
   if (!opened) {
@@ -322,67 +336,219 @@ export async function switchStore(page: Page, opts: SwitchStoreOpts): Promise<vo
     rowText: result.rowText.slice(0, 120),
   });
 
-  await page
+  // Modal fecha rápido na prática; não ficar 15s+ esperando
+  const modalClosed = await page
     .waitForFunction(
-      () => {
-        const body = document.body?.innerText || '';
-        return !/selecione a loja/i.test(body);
-      },
-      { timeout: 15_000 },
+      () => !/selecione a loja/i.test(document.body?.innerText || ''),
+      { timeout: 5_000 },
     )
-    .catch(() => {
-      log.warn('switchStore', 'Modal ainda visível após clique — continuando validação do header');
+    .then(() => true)
+    .catch(() => false);
+
+  if (!modalClosed) {
+    log.warn('switchStore', 'Modal ainda visível após 5s — seguindo pra confirmação');
+  }
+
+  // Confirmação preferida: a linha clicada já traz ID/nome/CNPJ + modal fechou.
+  // (O texto do header "Calenza..." NUNCA muda entre lojas — não usar.)
+  if (
+    modalClosed &&
+    rowTextMatchesTarget(result.rowText, lojaId, nomeNaTabela, cnpj)
+  ) {
+    log.info('switchStore', 'Troca confirmada via linha clicada + modal fechou', {
+      rowText: result.rowText.slice(0, 120),
     });
+    await dismissOverlays(page);
+    log.info('switchStore', `Contexto da loja ${lojaId} ativo`);
+    return;
+  }
 
-  await sleep(1000);
-  const headerAfter = await waitForStoreSwitch(page, nomeNaTabela, lojaId, headerBefore);
+  const confirmed = await confirmStoreSwitch(page, lojaId, nomeNaTabela, cnpj);
+  await dismissOverlays(page);
+  log.info('switchStore', `Contexto da loja ${lojaId} ativo`, confirmed);
+}
 
-  log.info('switchStore', `Contexto da loja ${lojaId} ativo`, {
-    before: headerBefore?.display,
-    after: headerAfter?.display,
+/** Fecha menus/dropdowns (ex: "Opções da loja" / frente de caixa) que cobrem o relatório. */
+export async function dismissOverlays(page: Page): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    await page.keyboard.press('Escape');
+    await sleep(150);
+  }
+  await page.evaluate(() => {
+    const backdrop = document.querySelector(
+      '.md-menu-backdrop, .md-dialog-backdrop, .modal-backdrop, .cdk-overlay-backdrop',
+    ) as HTMLElement | null;
+    backdrop?.click();
+  });
+  await sleep(200);
+}
+
+function rowTextMatchesTarget(
+  rowText: string,
+  lojaId: number,
+  nomeNaTabela?: string,
+  cnpj?: string,
+): boolean {
+  const norm = normalize(rowText);
+  if (norm.includes(String(lojaId))) return true;
+  if (cnpj && rowText.replace(/\D/g, '').includes(cnpj.replace(/\D/g, ''))) return true;
+  if (nomeNaTabela && norm.includes(normalize(nomeNaTabela))) return true;
+  return false;
+}
+
+interface StoreIdentity {
+  source: string;
+  storeId: number | null;
+  nameHint: string;
+  cnpjHint: string;
+}
+
+function identityMatchesTarget(
+  identity: StoreIdentity,
+  lojaId: number,
+  nomeNaTabela?: string,
+  cnpj?: string,
+): boolean {
+  if (identity.storeId !== null && identity.storeId === lojaId) return true;
+
+  const hay = normalize(
+    [identity.nameHint, identity.cnpjHint].filter(Boolean).join(' | '),
+  );
+  if (!hay) return false;
+
+  if (cnpj) {
+    const cnpjDigits = cnpj.replace(/\D/g, '');
+    if (cnpjDigits && hay.replace(/\D/g, '').includes(cnpjDigits)) return true;
+    if (hay.includes(normalize(cnpj))) return true;
+  }
+
+  if (nomeNaTabela && hay.includes(normalize(nomeNaTabela))) return true;
+
+  if (nomeNaTabela?.includes(' - ')) {
+    const suffix = normalize(nomeNaTabela.split(' - ').slice(1).join(' - '));
+    if (suffix.length >= 3 && hay.includes(suffix)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Lê identidade real da loja atual:
+ * 1) Angular vm.idCurrentStore / id_store
+ * 2) title/aria-label completos (não o texto truncado "Calenza...")
+ * 3) CNPJ / nome completo visível no body
+ */
+async function readCurrentStoreIdentity(page: Page): Promise<StoreIdentity | null> {
+  return page.evaluate(() => {
+    const result: {
+      source: string;
+      storeId: number | null;
+      nameHint: string;
+      cnpjHint: string;
+    } = { source: '', storeId: null, nameHint: '', cnpjHint: '' };
+
+    const win = window as unknown as {
+      angular?: {
+        element: (el: Element) => {
+          scope?: () => Record<string, unknown> | undefined;
+          injector?: () => { get: (name: string) => unknown };
+        };
+      };
+    };
+
+    // 1) Angular scopes — procura idCurrentStore / id_store
+    if (win.angular) {
+      const scopes = Array.from(document.querySelectorAll('.ng-scope'));
+      for (const el of scopes) {
+        try {
+          let scope: Record<string, unknown> | undefined | null =
+            win.angular.element(el).scope?.() ?? null;
+          let depth = 0;
+          while (scope && depth < 12) {
+            const vm = scope.vm as Record<string, unknown> | undefined;
+            const candidates = [
+              vm?.idCurrentStore,
+              vm?.id_store,
+              vm?.idStore,
+              scope.idCurrentStore,
+              scope.id_store,
+            ];
+            for (const c of candidates) {
+              const n = Number(c);
+              if (Number.isFinite(n) && n > 0) {
+                result.storeId = n;
+                result.source = 'angular:idCurrentStore';
+                // tenta nome junto
+                const nameCand =
+                  (vm?.nameCurrentStore as string) ||
+                  (vm?.storeName as string) ||
+                  (scope.nameCurrentStore as string) ||
+                  '';
+                if (nameCand) result.nameHint = String(nameCand);
+                return result;
+              }
+            }
+            scope = (scope.$parent as Record<string, unknown> | undefined) ?? null;
+            depth += 1;
+          }
+        } catch {
+          // ignore scope access errors
+        }
+      }
+    }
+
+    // 2) title / aria-label com nome completo (não o display truncado)
+    const nodes = Array.from(
+      document.querySelectorAll('button, a, span, div, md-button, [title], [aria-label]'),
+    );
+    for (const el of nodes) {
+      const title = el.getAttribute('title') || '';
+      const aria = el.getAttribute('aria-label') || '';
+      const tip = `${title} ${aria}`.trim();
+      if (!tip) continue;
+      if (/calenzano\s*-\s*/i.test(tip) || /\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/.test(tip)) {
+        result.source = 'attr:title|aria';
+        result.nameHint = tip;
+        const m = tip.match(/\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}/);
+        if (m) result.cnpjHint = m[0];
+        return result;
+      }
+    }
+
+    // body:cnpj propositalmente NÃO é usado pra identidade — na home/listagens
+    // aparecem CNPJs de várias lojas e geram falso positivo de "já na loja".
+    return null;
   });
 }
 
-async function waitForStoreSwitch(
+/**
+ * Confirma a troca sem depender do texto truncado do header.
+ * Timeout curto (4s) — se não confirmar, segue (o clique já foi no botão certo).
+ */
+async function confirmStoreSwitch(
   page: Page,
-  nomeNaTabela: string | undefined,
   lojaId: number,
-  before: HeaderStoreInfo | null,
-): Promise<HeaderStoreInfo | null> {
-  const deadline = Date.now() + Math.min(config.selectorTimeoutMs, 20_000);
+  nomeNaTabela: string | undefined,
+  cnpj: string | undefined,
+): Promise<StoreIdentity | { source: string; note: string }> {
+  const deadline = Date.now() + 4_000;
 
   while (Date.now() < deadline) {
-    const current = await readCurrentStoreFromHeader(page);
-    if (current) {
-      if (nomeNaTabela && storeIdentityMatches(current, nomeNaTabela, lojaId)) {
-        log.info('switchStore', `Header confirma loja alvo: "${current.display}"`, current);
-        return current;
-      }
-
-      const beforeDisp = before?.display ?? '';
-      if (
-        current.display &&
-        !/selecionar loja/i.test(current.display) &&
-        current.display !== beforeDisp
-      ) {
-        log.info(
-          'switchStore',
-          `Header mudou de "${beforeDisp}" → "${current.display}" (troca aceita)`,
-          current,
-        );
-        return current;
-      }
+    const identity = await readCurrentStoreIdentity(page);
+    if (identity && identityMatchesTarget(identity, lojaId, nomeNaTabela, cnpj)) {
+      log.info('switchStore', 'Troca confirmada', identity);
+      return identity;
     }
-    await sleep(400);
+    await sleep(250);
   }
 
-  const finalHeader = await readCurrentStoreFromHeader(page);
+  const last = await readCurrentStoreIdentity(page);
   log.warn(
     'switchStore',
-    'Não confirmei mudança clara no header após changeCurrentStore — seguindo mesmo assim',
-    { before, after: finalHeader },
+    'Confirmação em 4s inconclusiva — seguindo (botão changeCurrentStore já clicado)',
+    { expectedId: lojaId, nomeNaTabela, cnpj, last },
   );
-  return finalHeader;
+  return last ?? { source: 'timeout', note: 'sem identidade legível' };
 }
 
 interface HeaderStoreInfo {
@@ -511,18 +677,10 @@ function storeIdentityMatches(
  * "Opções da loja" (menu operacional: reforço, retirada, etc.).
  */
 async function openStoreModal(page: Page): Promise<boolean> {
+  await sleep(500);
+
   const clicked = await page.evaluate(() => {
     const visible = (el: HTMLElement) => el.getClientRects().length > 0;
-    const ownText = (el: Element) => {
-      // texto "próprio" (sem filhos) + fallback curto
-      let own = '';
-      for (const node of Array.from(el.childNodes)) {
-        if (node.nodeType === Node.TEXT_NODE) own += node.textContent || '';
-      }
-      own = own.replace(/\s+/g, ' ').trim();
-      if (own) return own;
-      return (el.textContent || '').replace(/\s+/g, ' ').trim();
-    };
 
     const tryClick = (el: Element): string => {
       const clickable =
@@ -530,36 +688,36 @@ async function openStoreModal(page: Page): Promise<boolean> {
         (el as HTMLElement);
       if (!visible(clickable) && !visible(el as HTMLElement)) return '';
       clickable.click();
-      return ownText(clickable).slice(0, 60) || ownText(el).slice(0, 60);
+      return (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
     };
 
     const all = Array.from(
-      document.querySelectorAll('button, a, md-button, span, div, [ng-click]'),
-    );
+      document.querySelectorAll('button, a, md-button, span, div, b, strong, [ng-click]'),
+    ) as HTMLElement[];
 
     // 1) "SELECIONAR LOJA" (login fresco)
     for (const el of all) {
-      const text = ownText(el);
-      if (/^selecionar loja$/i.test(text)) {
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (/^selecionar loja$/i.test(text) && visible(el)) {
         const t = tryClick(el);
         if (t) return { ok: true, via: 'selecionar-loja', text: t };
       }
     }
 
-    // 2) Nome abreviado da loja no header ("Calenza...") — este abre o modal certo
+    // 2) Nó cujo textContent INTEIRO é só o nome truncado ("Calenza...")
+    //    — ignora containers grandes do menu operacional
     for (const el of all) {
-      const text = ownText(el);
-      if (!text || text.length > 24) continue;
-      if (!/^calenza/i.test(text) && !/\.\.\.$/.test(text)) continue;
-      // evita clicar em containers gigantes do menu operacional
-      const full = (el.textContent || '').replace(/\s+/g, ' ').trim();
-      if (full.length > 40) continue;
+      if (!visible(el)) continue;
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length < 4 || text.length > 18) continue;
+      if (!/^calenza/i.test(text)) continue;
       const t = tryClick(el);
       if (t) return { ok: true, via: 'header-nome-loja', text: t };
     }
 
     // 3) title/aria com nome da loja
     for (const el of all) {
+      if (!visible(el)) continue;
       const title = el.getAttribute('title') || '';
       const aria = el.getAttribute('aria-label') || '';
       if (!/calenza/i.test(title) && !/calenza/i.test(aria)) continue;
@@ -567,39 +725,88 @@ async function openStoreModal(page: Page): Promise<boolean> {
       if (t) return { ok: true, via: 'header-title', text: t || title || aria };
     }
 
+    // 4) TreeWalker: menor nó de texto "Calenza..."
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length < 4 || text.length > 18) continue;
+      if (!/^calenza/i.test(text)) continue;
+      const parent = node.parentElement;
+      if (!parent || !visible(parent)) continue;
+      const t = tryClick(parent);
+      if (t) return { ok: true, via: 'header-textnode', text: t };
+    }
+
     return { ok: false, via: '', text: '' };
   });
 
   if (clicked.ok) {
     log.info('switchStore', `Clique no seletor via ${clicked.via}: "${clicked.text}"`);
-    await sleep(600);
-    // Se abriu menu intermediário, tenta item "Selecionar/Trocar/Alterar loja"
-    await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll('a, button, md-menu-item, li, span'));
-      for (const el of items) {
-        const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (
-          /^(selecionar|trocar|alterar)\s+loja$/i.test(text) ||
-          /^selecione a loja$/i.test(text)
-        ) {
-          const clickable =
-            (el.closest('a, button, md-menu-item, [ng-click]') as HTMLElement | null) ||
-            (el as HTMLElement);
-          clickable.click();
-          return;
-        }
-      }
+    await sleep(700);
+
+    // Às vezes "Calenza..." abre o menu operacional (frente de caixa), não o modal de lojas
+    const openedWhat = await page.evaluate(() => {
+      const body = document.body?.innerText || '';
+      const storeModal =
+        /selecione a loja/i.test(body) ||
+        Array.from(document.querySelectorAll('button')).some((b) =>
+          /changeCurrentStore/i.test(b.getAttribute('ng-click') || ''),
+        );
+      const opsMenu = /frente de caixa/i.test(body) && /retirada de frente/i.test(body);
+      return { storeModal, opsMenu };
     });
-    await sleep(400);
-    return true;
+
+    if (openedWhat.storeModal) return true;
+
+    if (openedWhat.opsMenu) {
+      log.warn(
+        'switchStore',
+        'Clique abriu menu operacional (frente de caixa) — fechando e tentando de novo',
+      );
+      await dismissOverlays(page);
+      await sleep(400);
+      // tenta de novo: clicar no mesmo seletor às vezes alterna; senão procura outro nó
+      const retry = await page.evaluate(() => {
+        const visible = (el: HTMLElement) => el.getClientRects().length > 0;
+        const nodes = Array.from(
+          document.querySelectorAll('button, a, md-button, span'),
+        ) as HTMLElement[];
+        for (const el of nodes) {
+          if (!visible(el)) continue;
+          const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (text.length > 18 || !/^calenza/i.test(text)) continue;
+          // preferir botão/link, não span solto dentro do menu ops
+          const clickable =
+            (el.closest('button, a, md-button') as HTMLElement | null) || el;
+          clickable.click();
+          return text;
+        }
+        return '';
+      });
+      if (retry) {
+        log.info('switchStore', `Retry seletor: "${retry}"`);
+        await sleep(700);
+        const ok = await page.evaluate(
+          () =>
+            /selecione a loja/i.test(document.body?.innerText || '') ||
+            Array.from(document.querySelectorAll('button')).some((b) =>
+              /changeCurrentStore/i.test(b.getAttribute('ng-click') || ''),
+            ),
+        );
+        if (ok) return true;
+      }
+      await dismissOverlays(page);
+    } else {
+      return true; // assume modal a caminho
+    }
   }
 
-  // Último recurso: "Opções da loja" → submenu de troca
+  // Último recurso: "Opções da loja" → submenu de troca OU nome da loja no dropdown
   const viaOpcoes = await page.evaluate(() => {
     const all = Array.from(document.querySelectorAll('a, button, span, div'));
     for (const el of all) {
       const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-      // só o link curto, não o container do menu
       if (!/^op[cç][oõ]es da loja$/i.test(text)) continue;
       if (text.length > 30) continue;
       (el as HTMLElement).click();
@@ -609,13 +816,20 @@ async function openStoreModal(page: Page): Promise<boolean> {
   });
 
   if (viaOpcoes) {
-    log.info('switchStore', 'Clique em "Opções da loja" — procurando item de troca no menu');
-    await sleep(600);
+    log.info('switchStore', 'Clique em "Opções da loja" — procurando troca no menu');
+    await sleep(700);
     const submenu = await page.evaluate(() => {
-      const items = Array.from(document.querySelectorAll('a, button, md-menu-item, li, span'));
+      const items = Array.from(
+        document.querySelectorAll('a, button, md-menu-item, li, span, div'),
+      );
       for (const el of items) {
         const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (/(selecionar|trocar|alterar)\s+loja/i.test(text) && text.length < 40) {
+        if (text.length > 40) continue;
+        if (
+          /(selecionar|trocar|alterar)\s+loja/i.test(text) ||
+          /^calenza/i.test(text) ||
+          /^selecione a loja$/i.test(text)
+        ) {
           const clickable =
             (el.closest('a, button, md-menu-item, [ng-click]') as HTMLElement | null) ||
             (el as HTMLElement);
@@ -626,14 +840,14 @@ async function openStoreModal(page: Page): Promise<boolean> {
       return '';
     });
     if (submenu) {
-      log.info('switchStore', `Submenu clicado: "${submenu}"`);
+      log.info('switchStore', `Item do menu clicado: "${submenu}"`);
       await sleep(500);
+      // Se clicou em Calenza... no dropdown, o modal de lojas deve abrir
       return true;
     }
     log.warn(
       'switchStore',
-      'Menu "Opções da loja" aberto, mas sem item Selecionar/Trocar loja — ' +
-        'pode ser o menu operacional (não o modal de lojas)',
+      'Menu "Opções da loja" aberto, sem item de troca — menu operacional',
     );
   }
 

@@ -62,7 +62,7 @@ export async function clickBuscar(page: Page): Promise<void> {
         ].join('|');
         return now !== prev && now.length > 0;
       },
-      { timeout: Math.min(config.selectorTimeoutMs, 25_000) },
+      { timeout: 8_000 },
       before,
     )
     .then(() => true)
@@ -74,18 +74,33 @@ export async function clickBuscar(page: Page): Promise<void> {
     log.info('clickBuscar', 'Fingerprint estável — aguardando networkidle');
     try {
       await page.waitForNetworkIdle({
-        idleTime: 1000,
-        timeout: config.selectorTimeoutMs,
+        idleTime: 800,
+        timeout: 10_000,
       });
       log.info('clickBuscar', 'networkidle atingido');
     } catch {
       log.warn(
         'clickBuscar',
-        'Nem fingerprint nem networkidle confirmaram atualização — aguardo fixo 3s',
+        'Nem fingerprint nem networkidle confirmaram atualização — aguardo fixo 1.5s',
       );
-      await sleep(3000);
+      await sleep(1500);
     }
   }
 
-  await sleep(800);
+  // Garante que algum label de métrica pintou (evita extract vazio após Buscar cedo demais)
+  await page
+    .waitForFunction(
+      () => {
+        const strongs = Array.from(document.querySelectorAll('strong'));
+        return strongs.some((s) =>
+          /qtde|total|pedido/i.test((s.textContent || '').trim()),
+        );
+      },
+      { timeout: 10_000 },
+    )
+    .catch(() => {
+      log.warn('clickBuscar', 'Labels de métrica não apareceram a tempo');
+    });
+
+  await sleep(400);
 }

@@ -1,11 +1,35 @@
 import type { StoreDef, StoreSlug } from './types.js';
 
-/** nomesNaTabela = texto exato/parcial na coluna Nome do modal "Selecione a loja" */
+/** nomesNaTabela / cnpj = dados reais do modal "Selecione a loja" */
 export const STORES: StoreDef[] = [
-  { slug: 'ahu', nome: 'Ahú', id: 1969, nomeNaTabela: 'Calenzano - Ahu' },
-  { slug: 'pilarzinho', nome: 'Pilarzinho', id: 1896, nomeNaTabela: 'Calenzano - Pilarzinho' },
-  { slug: 'portao', nome: 'Portão', id: 1759, nomeNaTabela: 'Calenzano - Portão' },
-  { slug: 'uberaba', nome: 'Uberaba', id: 8475, nomeNaTabela: 'Calenzano - Uberaba' },
+  {
+    slug: 'ahu',
+    nome: 'Ahú',
+    id: 1969,
+    nomeNaTabela: 'Calenzano - Ahu',
+    cnpj: '08.821.071/0001-67',
+  },
+  {
+    slug: 'pilarzinho',
+    nome: 'Pilarzinho',
+    id: 1896,
+    nomeNaTabela: 'Calenzano - Pilarzinho',
+    cnpj: '18.845.971/0001-06',
+  },
+  {
+    slug: 'portao',
+    nome: 'Portão',
+    id: 1759,
+    nomeNaTabela: 'Calenzano - Portão',
+    cnpj: '06.130.111/0001-07',
+  },
+  {
+    slug: 'uberaba',
+    nome: 'Uberaba',
+    id: 8475,
+    nomeNaTabela: 'Calenzano - Uberaba',
+    cnpj: '43.820.853/0001-82',
+  },
 ];
 
 export const STORE_BY_SLUG: Record<StoreSlug, StoreDef> = Object.fromEntries(

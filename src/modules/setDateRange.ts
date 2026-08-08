@@ -8,43 +8,87 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function resolveDateSelector(
-  page: Page,
-  kind: 'inicial' | 'final',
-): Promise<string> {
-  const byId = kind === 'inicial' ? '#datePickerSaipos_3' : '#datePickerSaipos_4';
-  const hasId = await page.$(byId);
-  if (hasId) return byId;
+/**
+ * Resolve seletores dos dois campos de data.
+ * Os IDs Saipos são incrementais (datePickerSaipos_3, _5, _6…) — não fixar.
+ */
+async function resolveDateSelectors(page: Page): Promise<{ ini: string; fim: string }> {
+  const found = await page.evaluate(() => {
+    const visible = (el: Element) => (el as HTMLElement).getClientRects().length > 0;
 
-  const label = kind === 'inicial' ? 'Data inicial' : 'Data final';
-  const found = await page.evaluate((lbl) => {
-    const byAria = document.querySelector(
-      `input[aria-label="${lbl}"], input[placeholder="${lbl}"]`,
-    );
-    if (byAria) {
-      if (byAria.id) return `#${byAria.id}`;
-      byAria.setAttribute('data-saipos-date', lbl);
-      return `input[data-saipos-date="${lbl}"]`;
+    // 1) Labels clássicos
+    for (const lbl of ['Data inicial', 'Data final'] as const) {
+      /* checked below in pair */
     }
-
-    const labels = Array.from(document.querySelectorAll('label'));
-    for (const lab of labels) {
-      if (!(lab.textContent || '').includes(lbl)) continue;
-      const forId = lab.getAttribute('for');
-      if (forId && document.getElementById(forId)) return `#${forId}`;
-      const next = lab.parentElement?.querySelector('input');
-      if (next) {
-        next.setAttribute('data-saipos-date', lbl);
-        return `input[data-saipos-date="${lbl}"]`;
+    const byLabel = (lbl: string): HTMLInputElement | null => {
+      const el = document.querySelector(
+        `input[aria-label="${lbl}"], input[placeholder="${lbl}"]`,
+      ) as HTMLInputElement | null;
+      if (el && visible(el)) return el;
+      for (const lab of Array.from(document.querySelectorAll('label'))) {
+        if (!(lab.textContent || '').includes(lbl)) continue;
+        const forId = lab.getAttribute('for');
+        if (forId) {
+          const input = document.getElementById(forId) as HTMLInputElement | null;
+          if (input && visible(input)) return input;
+        }
+        const next = lab.parentElement?.querySelector('input') as HTMLInputElement | null;
+        if (next && visible(next)) return next;
       }
+      return null;
+    };
+
+    const iniLabeled = byLabel('Data inicial');
+    const fimLabeled = byLabel('Data final');
+    if (iniLabeled && fimLabeled) {
+      iniLabeled.setAttribute('data-saipos-date', 'inicial');
+      fimLabeled.setAttribute('data-saipos-date', 'final');
+      return {
+        ini: 'input[data-saipos-date="inicial"]',
+        fim: 'input[data-saipos-date="final"]',
+      };
     }
+
+    // 2) IDs conhecidos legados
+    const d3 = document.querySelector('#datePickerSaipos_3') as HTMLInputElement | null;
+    const d4 = document.querySelector('#datePickerSaipos_4') as HTMLInputElement | null;
+    if (d3 && d4 && visible(d3) && visible(d4)) {
+      return { ini: '#datePickerSaipos_3', fim: '#datePickerSaipos_4' };
+    }
+
+    // 3) Qualquer par visível datePickerSaipos_*
+    const saipos = Array.from(
+      document.querySelectorAll('input[id^="datePickerSaipos_"]'),
+    ).filter(visible) as HTMLInputElement[];
+    if (saipos.length >= 2) {
+      saipos[0].setAttribute('data-saipos-date', 'inicial');
+      saipos[1].setAttribute('data-saipos-date', 'final');
+      return {
+        ini: 'input[data-saipos-date="inicial"]',
+        fim: 'input[data-saipos-date="final"]',
+      };
+    }
+
+    // 4) placeholder genérico "Selecione a data"
+    const genericos = Array.from(
+      document.querySelectorAll('input[placeholder="Selecione a data"]'),
+    ).filter(visible) as HTMLInputElement[];
+    if (genericos.length >= 2) {
+      genericos[0].setAttribute('data-saipos-date', 'inicial');
+      genericos[1].setAttribute('data-saipos-date', 'final');
+      return {
+        ini: 'input[data-saipos-date="inicial"]',
+        fim: 'input[data-saipos-date="final"]',
+      };
+    }
+
     return null;
-  }, label);
+  });
 
   if (!found) {
     throw new Error(
-      `setDateRange: campo "${label}" não encontrado ` +
-        `(tentei ${byId}, aria-label/placeholder e <label>).`,
+      'setDateRange: não encontrei par de campos de data ' +
+        '(datePickerSaipos_*, Data inicial/final, ou Selecione a data).',
     );
   }
   return found;
@@ -53,7 +97,6 @@ async function resolveDateSelector(
 async function fillDateInput(page: Page, selector: string, value: string): Promise<void> {
   await page.waitForSelector(selector, { timeout: config.selectorTimeoutMs });
 
-  // Preferência: setter nativo + eventos Angular (mais confiável com máscara)
   const applied = await page.$eval(
     selector,
     (el, val) => {
@@ -77,7 +120,6 @@ async function fillDateInput(page: Page, selector: string, value: string): Promi
     return;
   }
 
-  // Fallback: digitação com seleção total
   await page.click(selector, { count: 3 });
   await sleep(80);
   await page.keyboard.down('Control');
@@ -101,8 +143,6 @@ async function fillDateInput(page: Page, selector: string, value: string): Promi
 
 /**
  * Preenche Data inicial e Data final no formato dd/MM/yyyy.
- * Preferência: #datePickerSaipos_3 / #datePickerSaipos_4
- * Fallback: aria-label / placeholder "Data inicial|final"
  */
 export async function setDateRange(
   page: Page,
@@ -117,8 +157,21 @@ export async function setDateRange(
 
   log.info('setDateRange', `Definindo período ${dataInicial} → ${dataFinal}`);
 
-  const selIni = await resolveDateSelector(page, 'inicial');
-  const selFim = await resolveDateSelector(page, 'final');
+  await page
+    .waitForFunction(
+      () => {
+        const saipos = document.querySelectorAll('input[id^="datePickerSaipos_"]');
+        const labeled = document.querySelector(
+          'input[aria-label="Data inicial"], input[placeholder="Data inicial"], ' +
+            'input[placeholder="Selecione a data"]',
+        );
+        return saipos.length >= 2 || Boolean(labeled);
+      },
+      { timeout: config.selectorTimeoutMs },
+    )
+    .catch(() => undefined);
+
+  const { ini: selIni, fim: selFim } = await resolveDateSelectors(page);
 
   await fillDateInput(page, selIni, dataInicial);
   await fillDateInput(page, selFim, dataFinal);

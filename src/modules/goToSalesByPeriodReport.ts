@@ -1,39 +1,53 @@
 import type { Page } from 'puppeteer-core';
 import { config } from '../config.js';
 import { log } from '../utils/logger.js';
+import { dismissOverlays } from './switchStore.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
- * Navega até Vendas por período.
- * Preferência: hash direta (já validada no scraper legado).
- * Fallback: menu ≡ → Relatórios → "Vendas por período".
+ * Navega até Vendas por período (após switchStore, tipicamente vindo da home).
  */
 export async function goToSalesByPeriodReport(page: Page): Promise<void> {
   log.info('goToReport', 'Navegando para Vendas por período');
+  await dismissOverlays(page);
 
-  if (/#\/app\/report\/sales-by-period/i.test(page.url())) {
-    const ready = await datePickersReady(page);
-    if (ready) {
-      log.info('goToReport', 'Já na rota sales-by-period');
-      return;
-    }
-  }
-
-  // Navegação direta pela hash (mais estável na SPA Angular)
   await page.goto(`${config.baseUrl}/${config.reportHash}`, {
     waitUntil: 'domcontentloaded',
     timeout: config.navTimeoutMs,
   });
   await sleep(1500);
+  await dismissOverlays(page);
 
-  const ok = await waitForReportReady(page, 15_000);
-  if (ok) {
+  try {
+    await page.waitForNetworkIdle({ idleTime: 1000, timeout: 10_000 });
+  } catch {
+    /* ignore */
+  }
+
+  if (await waitForReportReady(page, 15_000)) {
     log.info('goToReport', 'Relatório carregado via hash', { url: page.url() });
     return;
   }
+
+  // Debug: o que tem na página quando pickers faltam
+  const debug = await page.evaluate(() => ({
+    url: location.href,
+    title: /vendas por per[ií]odo/i.test(document.body?.innerText || ''),
+    inputs: Array.from(document.querySelectorAll('input'))
+      .slice(0, 20)
+      .map((i) => ({
+        id: i.id,
+        aria: i.getAttribute('aria-label'),
+        placeholder: i.placeholder,
+        type: i.type,
+        visible: i.getClientRects().length > 0,
+      })),
+    bodyHead: (document.body?.innerText || '').slice(0, 500),
+  }));
+  log.warn('goToReport', 'Pickers ausentes após goto — dump', debug);
 
   log.warn('goToReport', 'Hash direta não mostrou o relatório — tentando menu');
   const viaMenu = await tryMenuNavigation(page);
@@ -44,7 +58,23 @@ export async function goToSalesByPeriodReport(page: Page): Promise<void> {
     );
   }
 
-  await waitForReportReady(page, config.selectorTimeoutMs);
+  if (!(await waitForReportReady(page, config.selectorTimeoutMs))) {
+    const debug2 = await page.evaluate(() => ({
+      url: location.href,
+      inputs: Array.from(document.querySelectorAll('input'))
+        .slice(0, 20)
+        .map((i) => ({
+          id: i.id,
+          aria: i.getAttribute('aria-label'),
+          placeholder: i.placeholder,
+        })),
+      bodyHead: (document.body?.innerText || '').slice(0, 500),
+    }));
+    throw new Error(
+      'goToSalesByPeriodReport: menu clicou mas date pickers não apareceram. ' +
+        JSON.stringify(debug2),
+    );
+  }
   log.info('goToReport', 'Relatório carregado via menu', { url: page.url() });
 }
 
@@ -54,13 +84,17 @@ async function waitForReportReady(page: Page, timeout: number): Promise<boolean>
       () => {
         const hashOk = /#\/app\/report\/sales-by-period/i.test(window.location.hash || '');
         const titleOk = /vendas por per[ií]odo/i.test(document.body?.innerText || '');
-        const pickers =
-          Boolean(document.querySelector('#datePickerSaipos_3')) ||
-          Boolean(
-            document.querySelector(
-              'input[aria-label="Data inicial"], input[placeholder="Data inicial"]',
-            ),
-          );
+        // IDs são incrementais (datePickerSaipos_3, _5, _6…) — não fixar _3/_4
+        const saiposPickers = Array.from(
+          document.querySelectorAll('input[id^="datePickerSaipos_"]'),
+        ).filter((el) => (el as HTMLElement).getClientRects().length > 0);
+        const labeled = Boolean(
+          document.querySelector(
+            'input[aria-label="Data inicial"], input[placeholder="Data inicial"], ' +
+              'input[placeholder="Selecione a data"]',
+          ),
+        );
+        const pickers = saiposPickers.length >= 2 || labeled;
         return (hashOk || titleOk) && pickers;
       },
       { timeout },
@@ -69,19 +103,6 @@ async function waitForReportReady(page: Page, timeout: number): Promise<boolean>
   } catch {
     return false;
   }
-}
-
-async function datePickersReady(page: Page): Promise<boolean> {
-  return page.evaluate(() => {
-    return (
-      Boolean(document.querySelector('#datePickerSaipos_3')) ||
-      Boolean(
-        document.querySelector(
-          'input[aria-label="Data inicial"], input[placeholder="Data inicial"]',
-        ),
-      )
-    );
-  });
 }
 
 async function tryMenuNavigation(page: Page): Promise<boolean> {
