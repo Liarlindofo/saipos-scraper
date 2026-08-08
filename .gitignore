@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+browser-data/
+logs/
+*.log
+.DS_Store
+npm-debug.log*
+.chrome-profile/
