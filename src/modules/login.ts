@@ -37,36 +37,207 @@ async function dumpDebug(page: Page, tag: string): Promise<void> {
   }
 }
 
-/**
- * Modal Angular Material: "Ôoops! Este usuário já está conectado..."
- */
-export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean> {
-  const clicked = await page.evaluate(() => {
-    const buttons = Array.from(document.querySelectorAll('button'));
-    for (const btn of buttons) {
+const SIM_CONFIRM_TIMEOUT_MS = 7000;
+
+type SimButtonCenter = { x: number; y: number };
+
+/** Localiza o botão SIM do modal de sessão duplicada (sem clicar). */
+async function findAlreadyConnectedSimCenter(page: Page): Promise<SimButtonCenter | null> {
+  return page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    const hasDialog = Boolean(document.querySelector('md-dialog, .md-dialog, md-dialog-content'));
+    const bodyLower = body.toLowerCase();
+    const looksLikeModal =
+      bodyLower.includes('conectado') ||
+      bodyLower.includes('ooops') ||
+      bodyLower.includes('oops') ||
+      hasDialog;
+    if (!looksLikeModal) return null;
+
+    const candidates = Array.from(
+      document.querySelectorAll(
+        'md-dialog button, .md-dialog button, md-dialog-actions button, button.md-primary, button',
+      ),
+    );
+    for (const btn of candidates) {
       const text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
-      if (text === 'SIM') {
-        const body = (document.body?.innerText || '').toLowerCase();
-        // Só clica SIM se parece o modal de sessão duplicada (evita outros diálogos)
-        if (
-          body.includes('conectado') ||
-          body.includes('ooops') ||
-          body.includes('oops') ||
-          document.querySelector('md-dialog, .md-dialog')
-        ) {
-          btn.click();
-          return true;
-        }
-      }
+      if (text !== 'SIM') continue;
+      const rect = (btn as HTMLElement).getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    }
+    return null;
+  });
+}
+
+/** True enquanto o modal de sessão duplicada ainda parece presente no DOM. */
+async function alreadyConnectedModalPresent(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const body = (document.body?.innerText || '').toLowerCase();
+    const hasSim = Array.from(
+      document.querySelectorAll('md-dialog button, .md-dialog button, button'),
+    ).some((b) => (b.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'SIM');
+    if (!hasSim) return false;
+    return (
+      body.includes('já está conectado') ||
+      body.includes('ja esta conectado') ||
+      body.includes('já esta conectado') ||
+      ((body.includes('conectado') || body.includes('ooops') || body.includes('oops')) &&
+        Boolean(document.querySelector('md-dialog, .md-dialog')))
+    );
+  });
+}
+
+/**
+ * Aguarda o modal sumir ou a URL sair de /access/login (~5–8s).
+ */
+async function waitForSimDismissConfirmation(
+  page: Page,
+  timeoutMs: number,
+): Promise<{ confirmed: boolean; reason: string }> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!isLoginUrl(page.url())) {
+      return { confirmed: true, reason: 'url_left_login' };
+    }
+    if (!(await alreadyConnectedModalPresent(page))) {
+      return { confirmed: true, reason: 'modal_gone' };
+    }
+    await sleep(250);
+  }
+  return {
+    confirmed: false,
+    reason: isLoginUrl(page.url()) ? 'still_on_login_and_modal' : 'timeout',
+  };
+}
+
+/** Clique 1: DOM click no botão SIM (Angular Material). */
+async function clickSimDom(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    const hasDialog = Boolean(document.querySelector('md-dialog, .md-dialog, md-dialog-content'));
+    const bodyLower = body.toLowerCase();
+    const looksLikeModal =
+      bodyLower.includes('conectado') ||
+      bodyLower.includes('ooops') ||
+      bodyLower.includes('oops') ||
+      hasDialog;
+    if (!looksLikeModal) return false;
+
+    const candidates = Array.from(
+      document.querySelectorAll(
+        'md-dialog button, .md-dialog button, md-dialog-actions button, button.md-primary, button',
+      ),
+    );
+    for (const btn of candidates) {
+      const text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
+      if (text !== 'SIM') continue;
+      (btn as HTMLElement).click();
+      return true;
     }
     return false;
   });
+}
 
-  if (clicked) {
-    log.info('login', 'Modal "usuário já conectado" — clique em SIM');
-    await sleep(1500);
+/** Clique 2: mouse no centro do botão (coordenadas viewport). */
+async function clickSimByCoordinates(page: Page): Promise<boolean> {
+  const center = await findAlreadyConnectedSimCenter(page);
+  if (!center) {
+    // Fallback: seletor md-dialog + filter text
+    const handles = await page.$$('md-dialog button, .md-dialog button, md-dialog-actions button');
+    for (const handle of handles) {
+      const text = await handle.evaluate((el) =>
+        (el.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase(),
+      );
+      if (text === 'SIM') {
+        const box = await handle.boundingBox();
+        if (box) {
+          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          return true;
+        }
+        await handle.click({ delay: 50 });
+        return true;
+      }
+    }
+    return false;
   }
-  return clicked;
+  await page.mouse.click(center.x, center.y, { delay: 50 });
+  return true;
+}
+
+/**
+ * Modal Angular Material: "Ôoops! Este usuário já está conectado..."
+ * Clica SIM, confirma sumiço/navegação, e tenta 2ª abordagem se falhar.
+ */
+export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean> {
+  const center = await findAlreadyConnectedSimCenter(page);
+  if (!center) return false;
+
+  // --- Tentativa 1: click DOM ---
+  log.info('login', 'Modal "usuário já conectado" — clique em SIM');
+  const clicked1 = await clickSimDom(page);
+  if (!clicked1) {
+    log.warn('login', 'Modal "usuário já conectado" — botão SIM sumiu antes do clique DOM');
+    return false;
+  }
+
+  await dumpDebug(page, 'after-sim-click');
+
+  let confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
+  if (confirm.confirmed) {
+    log.info('login', 'Modal "usuário já conectado" — confirmação OK após clique SIM', {
+      reason: confirm.reason,
+      url: page.url(),
+      attempt: 1,
+    });
+    return true;
+  }
+
+  log.warn('login', 'Modal "usuário já conectado" — clique SIM NÃO confirmado', {
+    reason: confirm.reason,
+    url: page.url(),
+    attempt: 1,
+    timeoutMs: SIM_CONFIRM_TIMEOUT_MS,
+  });
+
+  // --- Tentativa 2: clique por coordenadas / seletor md-dialog ---
+  if (!(await alreadyConnectedModalPresent(page))) {
+    log.info('login', 'Modal "usuário já conectado" — modal sumiu entre tentativas', {
+      url: page.url(),
+    });
+    return true;
+  }
+
+  log.info(
+    'login',
+    'Modal "usuário já conectado" — retry: clique via coordenadas do centro do botão',
+  );
+  const clicked2 = await clickSimByCoordinates(page);
+  if (!clicked2) {
+    log.warn('login', 'Modal "usuário já conectado" — retry falhou: botão SIM não encontrado');
+    await dumpDebug(page, 'after-sim-click-retry-miss');
+    return false;
+  }
+
+  await dumpDebug(page, 'after-sim-click-retry');
+
+  confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
+  if (confirm.confirmed) {
+    log.info('login', 'Modal "usuário já conectado" — confirmação OK após retry', {
+      reason: confirm.reason,
+      url: page.url(),
+      attempt: 2,
+    });
+    return true;
+  }
+
+  log.warn('login', 'Modal "usuário já conectado" — retry também NÃO confirmou', {
+    reason: confirm.reason,
+    url: page.url(),
+    attempt: 2,
+    timeoutMs: SIM_CONFIRM_TIMEOUT_MS,
+  });
+  return false;
 }
 
 async function isLoggedIn(page: Page): Promise<boolean> {
