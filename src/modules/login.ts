@@ -25,71 +25,157 @@ async function loginFormVisible(page: Page): Promise<boolean> {
   });
 }
 
-async function dumpDebug(page: Page, tag: string): Promise<void> {
+async function dumpDebug(page: Page, tag: string): Promise<string | null> {
   try {
     const dir = path.resolve('logs');
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, `debug-${tag}-${Date.now()}.png`);
     await page.screenshot({ path: file, fullPage: true });
     log.warn('login', `Screenshot de debug: ${file}`, { url: page.url() });
+    return file;
   } catch (err) {
     log.warn('login', 'Falha ao salvar screenshot de debug', err);
+    return null;
   }
 }
 
-const SIM_CONFIRM_TIMEOUT_MS = 7000;
+const SIM_CONFIRM_TIMEOUT_MS = 9000;
 
-type SimButtonCenter = { x: number; y: number };
+type ModalDump = {
+  present: boolean;
+  dialogSelector: string;
+  dialogText: string;
+  dialogHtml: string;
+  simButtons: Array<{
+    text: string;
+    className: string;
+    ngClick: string;
+    disabled: boolean;
+    visible: boolean;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    outerHTML: string;
+  }>;
+};
 
-/** Localiza o botão SIM do modal de sessão duplicada (sem clicar). */
-async function findAlreadyConnectedSimCenter(page: Page): Promise<SimButtonCenter | null> {
+/** Inspecta o modal de sessão duplicada (HTML + botões SIM). */
+async function dumpAlreadyConnectedModal(page: Page): Promise<ModalDump> {
   return page.evaluate(() => {
-    const body = document.body?.innerText || '';
-    const hasDialog = Boolean(document.querySelector('md-dialog, .md-dialog, md-dialog-content'));
-    const bodyLower = body.toLowerCase();
-    const looksLikeModal =
-      bodyLower.includes('conectado') ||
-      bodyLower.includes('ooops') ||
-      bodyLower.includes('oops') ||
-      hasDialog;
-    if (!looksLikeModal) return null;
+    // SweetAlert / Bootstrap confirm (Saipos real) OU Angular Material
+    const dialogCandidates = [
+      document.querySelector('.sweet-alert') as HTMLElement | null,
+      document.querySelector('.sweet-alert.showSweetAlert') as HTMLElement | null,
+      document.querySelector('.sa-confirm-button-container')?.closest(
+        '.sweet-alert, .sa-button-container, div',
+      ) as HTMLElement | null,
+      document.querySelector('md-dialog') as HTMLElement | null,
+      document.querySelector('.md-dialog') as HTMLElement | null,
+      document.querySelector('[class*="md-dialog"]') as HTMLElement | null,
+      document.querySelector('md-dialog-content') as HTMLElement | null,
+    ].filter(Boolean) as HTMLElement[];
 
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'md-dialog button, .md-dialog button, md-dialog-actions button, button.md-primary, button',
-      ),
-    );
-    for (const btn of candidates) {
-      const text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
-      if (text !== 'SIM') continue;
-      const rect = (btn as HTMLElement).getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) continue;
-      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    let dialog = dialogCandidates[0] || null;
+
+    // Se só achamos o botão .confirm "Sim", sobe até o container do alerta
+    if (!dialog) {
+      const confirmBtn = Array.from(document.querySelectorAll('button.confirm, button')).find(
+        (b) => (b.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'SIM',
+      ) as HTMLElement | undefined;
+      if (confirmBtn) {
+        let el: HTMLElement | null = confirmBtn;
+        for (let i = 0; i < 8 && el; i++) {
+          const cls = String(el.className || '').toLowerCase();
+          if (
+            cls.includes('sweet-alert') ||
+            cls.includes('swal') ||
+            cls.includes('modal') ||
+            cls.includes('dialog') ||
+            el.getAttribute('role') === 'dialog'
+          ) {
+            dialog = el;
+            break;
+          }
+          el = el.parentElement;
+        }
+        if (!dialog && confirmBtn.parentElement) {
+          // sobe 3 níveis como fallback (sa-button-container → sweet-alert)
+          dialog =
+            confirmBtn.closest('.sweet-alert, .swal2-popup, .modal, [role="dialog"]') ||
+            confirmBtn.parentElement?.parentElement?.parentElement ||
+            confirmBtn.parentElement;
+        }
+      }
     }
-    return null;
+
+    const body = (document.body?.innerText || '').toLowerCase();
+    const looksLike =
+      Boolean(dialog) ||
+      body.includes('conectado') ||
+      body.includes('ooops') ||
+      body.includes('oops') ||
+      Boolean(document.querySelector('button.confirm'));
+
+    const root: ParentNode = dialog || document;
+    const buttons = Array.from(root.querySelectorAll('button, md-button, [role="button"]'));
+    const simButtons = buttons
+      .filter((b) => {
+        const t = (b.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
+        return t === 'SIM' || /^SIM\b/.test(t);
+      })
+      .map((b) => {
+        const el = b as HTMLElement;
+        const rect = el.getBoundingClientRect();
+        return {
+          text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+          className: String(el.className || ''),
+          ngClick: el.getAttribute('ng-click') || '',
+          disabled: Boolean((el as HTMLButtonElement).disabled) || el.getAttribute('disabled') !== null,
+          visible: rect.width > 0 && rect.height > 0,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          w: rect.width,
+          h: rect.height,
+          outerHTML: el.outerHTML.slice(0, 2000),
+        };
+      });
+
+    const dialogText = dialog
+      ? (dialog.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1000)
+      : '';
+    const dialogHtml = dialog ? dialog.outerHTML.slice(0, 8000) : '';
+
+    return {
+      present: looksLike && (Boolean(dialog) || simButtons.length > 0),
+      dialogSelector: dialog
+        ? dialog.tagName.toLowerCase() +
+          (dialog.className ? `.${String(dialog.className).split(/\s+/).slice(0, 3).join('.')}` : '')
+        : '',
+      dialogText,
+      dialogHtml,
+      simButtons,
+    };
   });
 }
 
 /** True enquanto o modal de sessão duplicada ainda parece presente no DOM. */
 async function alreadyConnectedModalPresent(page: Page): Promise<boolean> {
-  return page.evaluate(() => {
-    const body = (document.body?.innerText || '').toLowerCase();
-    const hasSim = Array.from(
-      document.querySelectorAll('md-dialog button, .md-dialog button, button'),
-    ).some((b) => (b.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'SIM');
-    if (!hasSim) return false;
-    return (
-      body.includes('já está conectado') ||
-      body.includes('ja esta conectado') ||
-      body.includes('já esta conectado') ||
-      ((body.includes('conectado') || body.includes('ooops') || body.includes('oops')) &&
-        Boolean(document.querySelector('md-dialog, .md-dialog')))
-    );
-  });
+  const dump = await dumpAlreadyConnectedModal(page);
+  if (!dump.present) return false;
+  const text = `${dump.dialogText} ${(await page.evaluate(() => document.body?.innerText || ''))}`.toLowerCase();
+  const hasSim = dump.simButtons.some((b) => b.text.toUpperCase().includes('SIM') && b.visible);
+  return (
+    hasSim &&
+    (text.includes('conectado') ||
+      text.includes('ooops') ||
+      text.includes('oops') ||
+      Boolean(dump.dialogHtml))
+  );
 }
 
 /**
- * Aguarda o modal sumir ou a URL sair de /access/login (~5–8s).
+ * Aguarda (a) modal sumir do DOM ou (b) URL sair de /access/login (~8–10s).
  */
 async function waitForSimDismissConfirmation(
   page: Page,
@@ -105,35 +191,49 @@ async function waitForSimDismissConfirmation(
     }
     await sleep(250);
   }
+  const stillModal = await alreadyConnectedModalPresent(page);
   return {
     confirmed: false,
-    reason: isLoginUrl(page.url()) ? 'still_on_login_and_modal' : 'timeout',
+    reason: stillModal
+      ? 'neither_modal_gone_nor_url_changed'
+      : 'timeout_ambiguous',
   };
 }
 
-/** Clique 1: DOM click no botão SIM (Angular Material). */
+/** Clique 1: DOM/JS click no botão SIM (SweetAlert `.confirm` ou md-dialog). */
 async function clickSimDom(page: Page): Promise<boolean> {
   return page.evaluate(() => {
-    const body = document.body?.innerText || '';
-    const hasDialog = Boolean(document.querySelector('md-dialog, .md-dialog, md-dialog-content'));
-    const bodyLower = body.toLowerCase();
-    const looksLikeModal =
-      bodyLower.includes('conectado') ||
-      bodyLower.includes('ooops') ||
-      bodyLower.includes('oops') ||
-      hasDialog;
-    if (!looksLikeModal) return false;
+    const isSim = (el: Element): boolean => {
+      const text = (el.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
+      const spanSim = Array.from(el.querySelectorAll('span')).some(
+        (s) => (s.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase() === 'SIM',
+      );
+      return text === 'SIM' || spanSim;
+    };
 
-    const candidates = Array.from(
-      document.querySelectorAll(
-        'md-dialog button, .md-dialog button, md-dialog-actions button, button.md-primary, button',
-      ),
+    // Preferência: SweetAlert real do Saipos
+    const sweetConfirm = document.querySelector(
+      '.sweet-alert button.confirm, .sweet-alert.showSweetAlert button.confirm, button.confirm.btn-warning',
     );
-    for (const btn of candidates) {
-      const text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase();
-      if (text !== 'SIM') continue;
-      (btn as HTMLElement).click();
+    if (sweetConfirm && isSim(sweetConfirm)) {
+      (sweetConfirm as HTMLElement).click();
       return true;
+    }
+
+    const roots: ParentNode[] = [
+      document.querySelector('.sweet-alert') ||
+        document.querySelector('md-dialog') ||
+        document.querySelector('.md-dialog') ||
+        document.querySelector('[class*="md-dialog"]') ||
+        document,
+    ];
+
+    for (const root of roots) {
+      for (const btn of Array.from(root.querySelectorAll('button, md-button'))) {
+        if (!isSim(btn)) continue;
+        (btn as HTMLElement).click();
+        return true;
+      }
     }
     return false;
   });
@@ -141,66 +241,95 @@ async function clickSimDom(page: Page): Promise<boolean> {
 
 /** Clique 2: mouse no centro do botão (coordenadas viewport). */
 async function clickSimByCoordinates(page: Page): Promise<boolean> {
-  const center = await findAlreadyConnectedSimCenter(page);
-  if (!center) {
-    // Fallback: seletor md-dialog + filter text
-    const handles = await page.$$('md-dialog button, .md-dialog button, md-dialog-actions button');
-    for (const handle of handles) {
-      const text = await handle.evaluate((el) =>
-        (el.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase(),
-      );
-      if (text === 'SIM') {
-        const box = await handle.boundingBox();
-        if (box) {
-          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-          return true;
-        }
-        await handle.click({ delay: 50 });
+  const dump = await dumpAlreadyConnectedModal(page);
+  const sim = dump.simButtons.find((b) => b.visible && b.text.toUpperCase().includes('SIM'));
+  if (sim) {
+    await page.mouse.click(sim.x, sim.y, { delay: 50 });
+    return true;
+  }
+
+  const handles = await page.$$(
+    'md-dialog button, .md-dialog button, md-dialog-actions button, button',
+  );
+  for (const handle of handles) {
+    const text = await handle.evaluate((el) =>
+      (el.textContent || '').replace(/\s+/g, ' ').trim().toUpperCase(),
+    );
+    if (text === 'SIM' || text.includes('SIM')) {
+      const box = await handle.boundingBox();
+      if (box) {
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { delay: 50 });
         return true;
       }
+      await handle.click({ delay: 50 });
+      return true;
     }
-    return false;
   }
-  await page.mouse.click(center.x, center.y, { delay: 50 });
-  return true;
+  return false;
 }
 
 /**
  * Modal Angular Material: "Ôoops! Este usuário já está conectado..."
- * Clica SIM, confirma sumiço/navegação, e tenta 2ª abordagem se falhar.
+ * Detecta → screenshot + HTML → clica SIM → screenshot → confirma sumiço/URL.
  */
 export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean> {
-  const center = await findAlreadyConnectedSimCenter(page);
-  if (!center) return false;
+  const dump = await dumpAlreadyConnectedModal(page);
+  if (!dump.present || dump.simButtons.length === 0) return false;
 
-  // --- Tentativa 1: click DOM ---
+  log.info('login', 'Modal "usuário já conectado" DETECTADO', {
+    url: page.url(),
+    dialogSelector: dump.dialogSelector,
+    dialogText: dump.dialogText,
+    simButtons: dump.simButtons.map((b) => ({
+      text: b.text,
+      className: b.className,
+      ngClick: b.ngClick,
+      disabled: b.disabled,
+      visible: b.visible,
+      x: b.x,
+      y: b.y,
+      w: b.w,
+      h: b.h,
+    })),
+  });
+  log.info('login', 'Modal "usuário já conectado" — outerHTML do dialog', {
+    dialogHtml: dump.dialogHtml || '(dialog não encontrado — veja botões)',
+    simButtonHtml: dump.simButtons.map((b) => b.outerHTML),
+  });
+
+  // 1) Screenshot ANTES do clique
+  await dumpDebug(page, 'modal-detected');
+
+  // 2) Clique DOM
   log.info('login', 'Modal "usuário já conectado" — clique em SIM');
   const clicked1 = await clickSimDom(page);
   if (!clicked1) {
-    log.warn('login', 'Modal "usuário já conectado" — botão SIM sumiu antes do clique DOM');
-    return false;
+    log.warn('login', 'Modal "usuário já conectado" — botão SIM não clicável via DOM');
   }
 
-  await dumpDebug(page, 'after-sim-click');
+  // 3) Screenshot IMEDIATO após o clique (antes de qualquer wait longo)
+  await dumpDebug(page, 'modal-clicked');
 
+  // 4) Confirmação ativa: modal some OU URL sai de /access/login
   let confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
   if (confirm.confirmed) {
-    log.info('login', 'Modal "usuário já conectado" — confirmação OK após clique SIM', {
+    log.info('login', 'Modal "usuário já conectado" — confirmação OK', {
       reason: confirm.reason,
       url: page.url(),
       attempt: 1,
+      clickedDom: clicked1,
     });
     return true;
   }
 
-  log.warn('login', 'Modal "usuário já conectado" — clique SIM NÃO confirmado', {
+  log.warn('login', 'Modal "usuário já conectado" — clique SIM NÃO confirmou (nem modal sumiu, nem URL mudou)', {
     reason: confirm.reason,
     url: page.url(),
     attempt: 1,
     timeoutMs: SIM_CONFIRM_TIMEOUT_MS,
   });
 
-  // --- Tentativa 2: clique por coordenadas / seletor md-dialog ---
+  // Retry: coordenadas
   if (!(await alreadyConnectedModalPresent(page))) {
     log.info('login', 'Modal "usuário já conectado" — modal sumiu entre tentativas', {
       url: page.url(),
@@ -213,13 +342,12 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
     'Modal "usuário já conectado" — retry: clique via coordenadas do centro do botão',
   );
   const clicked2 = await clickSimByCoordinates(page);
+  await dumpDebug(page, 'modal-clicked-retry');
+
   if (!clicked2) {
     log.warn('login', 'Modal "usuário já conectado" — retry falhou: botão SIM não encontrado');
-    await dumpDebug(page, 'after-sim-click-retry-miss');
     return false;
   }
-
-  await dumpDebug(page, 'after-sim-click-retry');
 
   confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
   if (confirm.confirmed) {
@@ -236,6 +364,13 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
     url: page.url(),
     attempt: 2,
     timeoutMs: SIM_CONFIRM_TIMEOUT_MS,
+  });
+
+  const after = await dumpAlreadyConnectedModal(page);
+  log.warn('login', 'Modal ainda presente após retries — HTML atual', {
+    dialogHtml: after.dialogHtml.slice(0, 4000),
+    dialogText: after.dialogText,
+    simButtons: after.simButtons,
   });
   return false;
 }
