@@ -329,12 +329,12 @@ async function clickSimByCoordinates(page: Page): Promise<boolean> {
 export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean> {
   const dump = await dumpAlreadyConnectedModal(page);
   const visibleSim = dump.simButtons.filter((b) => b.visible);
-  // SweetAlert fica no DOM com hideSweetAlert / display:none — ignorar fantasmas
-  const dialogHidden =
+  // SweetAlert fica no DOM após fechar (hideSweetAlert). NÃO usar /display:none/
+  // no outerHTML — os ícones filhos (error/info/success) sempre têm display:none.
+  const isGhost =
     /hideSweetAlert/i.test(dump.dialogSelector) ||
-    /display:\s*none/i.test(dump.dialogHtml) ||
-    visibleSim.length === 0;
-  if (!dump.present || dialogHidden) return false;
+    (!/showSweetAlert/i.test(dump.dialogSelector) && visibleSim.length === 0);
+  if (!dump.present || isGhost || visibleSim.length === 0) return false;
 
   log.info('login', 'Modal "usuário já conectado" DETECTADO', {
     url: page.url(),
@@ -531,6 +531,12 @@ export async function login(page: Page): Promise<void> {
 
     if (dismissed) {
       // SIM só desconecta a outra sessão; formulário volta e precisa re-submeter
+      log.info('login', 'Reenviando submit após desconexão', {
+        url: page.url(),
+        stillOnLogin: isLoginUrl(page.url()),
+        formVisible: await loginFormVisible(page),
+      });
+
       if (isLoginUrl(page.url()) || (await loginFormVisible(page))) {
         log.info(
           'login',
@@ -559,6 +565,10 @@ export async function login(page: Page): Promise<void> {
           timeoutMs: POST_RESUBMIT_TIMEOUT_MS,
         });
         // segue o loop / timeout final como falha real
+      } else {
+        log.warn('login', 'Modal dismissado mas não estou em login nem vejo o form — sem re-submit', {
+          url: page.url(),
+        });
       }
     }
 
