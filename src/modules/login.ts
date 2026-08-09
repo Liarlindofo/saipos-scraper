@@ -175,7 +175,8 @@ async function alreadyConnectedModalPresent(page: Page): Promise<boolean> {
 }
 
 /**
- * Aguarda (a) modal sumir do DOM ou (b) URL sair de /access/login (~8–10s).
+ * Aguarda o modal SweetAlert sumir do DOM (~8–10s).
+ * Nota: sumir o modal NÃO significa login concluído — só desconectou a outra sessão.
  */
 async function waitForSimDismissConfirmation(
   page: Page,
@@ -183,20 +184,73 @@ async function waitForSimDismissConfirmation(
 ): Promise<{ confirmed: boolean; reason: string }> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (!isLoginUrl(page.url())) {
-      return { confirmed: true, reason: 'url_left_login' };
-    }
     if (!(await alreadyConnectedModalPresent(page))) {
       return { confirmed: true, reason: 'modal_gone' };
     }
+    // Se por algum motivo já saiu do login, também conta como modal resolvido
+    if (!isLoginUrl(page.url()) && (await isLoggedIn(page))) {
+      return { confirmed: true, reason: 'already_logged_in' };
+    }
     await sleep(250);
   }
-  const stillModal = await alreadyConnectedModalPresent(page);
   return {
     confirmed: false,
-    reason: stillModal
-      ? 'neither_modal_gone_nor_url_changed'
-      : 'timeout_ambiguous',
+    reason: 'modal_still_present',
+  };
+}
+
+/** Botão vermelho (md-fab) / submit do formulário de login. */
+async function clickLoginSubmit(page: Page): Promise<boolean> {
+  const submitted = await page.evaluate(() => {
+    const form = document.querySelector('form[name="loginForm"]') as HTMLFormElement | null;
+    const candidates: Array<Element | null | undefined> = [
+      document.querySelector('button.md-fab'),
+      document.querySelector('button[ng-click*="lctrl.login"]'),
+      form?.querySelector('button[type="submit"]'),
+      form?.querySelector('button[ng-click*="login"]'),
+      ...Array.from(document.querySelectorAll('button')).filter((b) =>
+        /entrar|login/i.test(b.textContent || ''),
+      ),
+    ];
+    for (const btn of candidates) {
+      if (btn instanceof HTMLElement) {
+        btn.click();
+        return true;
+      }
+    }
+    return false;
+  });
+
+  if (!submitted) {
+    log.warn('login', 'Botão submit não encontrado — enviando Enter');
+    await page.keyboard.press('Enter');
+    return true;
+  }
+  return true;
+}
+
+/** Aguarda sair de /access/login (login real concluído). */
+async function waitUntilLeftLogin(
+  page: Page,
+  timeoutMs: number,
+): Promise<{ ok: boolean; reason: string }> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    // Modal pode reaparecer no re-submit — deixa o caller tratar
+    if (await alreadyConnectedModalPresent(page)) {
+      return { ok: false, reason: 'modal_reappeared' };
+    }
+    if (await isLoggedIn(page)) {
+      return { ok: true, reason: 'logged_in' };
+    }
+    if (!isLoginUrl(page.url()) && !(await loginFormVisible(page))) {
+      return { ok: true, reason: 'left_login_url' };
+    }
+    await sleep(250);
+  }
+  return {
+    ok: false,
+    reason: isLoginUrl(page.url()) ? 'still_on_login' : 'timeout',
   };
 }
 
@@ -274,13 +328,19 @@ async function clickSimByCoordinates(page: Page): Promise<boolean> {
  */
 export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean> {
   const dump = await dumpAlreadyConnectedModal(page);
-  if (!dump.present || dump.simButtons.length === 0) return false;
+  const visibleSim = dump.simButtons.filter((b) => b.visible);
+  // SweetAlert fica no DOM com hideSweetAlert / display:none — ignorar fantasmas
+  const dialogHidden =
+    /hideSweetAlert/i.test(dump.dialogSelector) ||
+    /display:\s*none/i.test(dump.dialogHtml) ||
+    visibleSim.length === 0;
+  if (!dump.present || dialogHidden) return false;
 
   log.info('login', 'Modal "usuário já conectado" DETECTADO', {
     url: page.url(),
     dialogSelector: dump.dialogSelector,
     dialogText: dump.dialogText,
-    simButtons: dump.simButtons.map((b) => ({
+    simButtons: visibleSim.map((b) => ({
       text: b.text,
       className: b.className,
       ngClick: b.ngClick,
@@ -294,7 +354,7 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
   });
   log.info('login', 'Modal "usuário já conectado" — outerHTML do dialog', {
     dialogHtml: dump.dialogHtml || '(dialog não encontrado — veja botões)',
-    simButtonHtml: dump.simButtons.map((b) => b.outerHTML),
+    simButtonHtml: visibleSim.map((b) => b.outerHTML),
   });
 
   // 1) Screenshot ANTES do clique
@@ -310,19 +370,20 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
   // 3) Screenshot IMEDIATO após o clique (antes de qualquer wait longo)
   await dumpDebug(page, 'modal-clicked');
 
-  // 4) Confirmação ativa: modal some OU URL sai de /access/login
+  // 4) Confirmação: só que o modal sumiu (NÃO é sucesso de login)
   let confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
   if (confirm.confirmed) {
-    log.info('login', 'Modal "usuário já conectado" — confirmação OK', {
+    log.info('login', 'Modal "usuário já conectado" — modal sumiu (outra sessão desconectada; login ainda pendente)', {
       reason: confirm.reason,
       url: page.url(),
+      stillOnLogin: isLoginUrl(page.url()),
       attempt: 1,
       clickedDom: clicked1,
     });
     return true;
   }
 
-  log.warn('login', 'Modal "usuário já conectado" — clique SIM NÃO confirmou (nem modal sumiu, nem URL mudou)', {
+  log.warn('login', 'Modal "usuário já conectado" — clique SIM NÃO confirmou (modal ainda presente)', {
     reason: confirm.reason,
     url: page.url(),
     attempt: 1,
@@ -331,8 +392,9 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
 
   // Retry: coordenadas
   if (!(await alreadyConnectedModalPresent(page))) {
-    log.info('login', 'Modal "usuário já conectado" — modal sumiu entre tentativas', {
+    log.info('login', 'Modal "usuário já conectado" — modal sumiu entre tentativas (login ainda pendente)', {
       url: page.url(),
+      stillOnLogin: isLoginUrl(page.url()),
     });
     return true;
   }
@@ -351,9 +413,10 @@ export async function dismissAlreadyConnectedModal(page: Page): Promise<boolean>
 
   confirm = await waitForSimDismissConfirmation(page, SIM_CONFIRM_TIMEOUT_MS);
   if (confirm.confirmed) {
-    log.info('login', 'Modal "usuário já conectado" — confirmação OK após retry', {
+    log.info('login', 'Modal "usuário já conectado" — modal sumiu após retry (login ainda pendente)', {
       reason: confirm.reason,
       url: page.url(),
+      stillOnLogin: isLoginUrl(page.url()),
       attempt: 2,
     });
     return true;
@@ -456,38 +519,49 @@ export async function login(page: Page): Promise<void> {
   await fillAngularInput(page, passSel, config.password);
   log.info('login', 'Credenciais preenchidas (Angular-compatible)');
 
-  // O submit do Saipos é o botão circular vermelho (md-fab) ao lado do card
-  const submitted = await page.evaluate(() => {
-    const form = document.querySelector('form[name="loginForm"]') as HTMLFormElement | null;
-    const candidates: Array<Element | null | undefined> = [
-      document.querySelector('button.md-fab'),
-      document.querySelector('button[ng-click*="lctrl.login"]'),
-      form?.querySelector('button[type="submit"]'),
-      form?.querySelector('button[ng-click*="login"]'),
-      ...Array.from(document.querySelectorAll('button')).filter((b) =>
-        /entrar|login/i.test(b.textContent || ''),
-      ),
-    ];
-    for (const btn of candidates) {
-      if (btn instanceof HTMLElement) {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  });
+  await clickLoginSubmit(page);
+  log.info('login', 'Submit clicado (1ª tentativa)');
 
-  if (!submitted) {
-    log.warn('login', 'Botão submit não encontrado — enviando Enter');
-    await page.keyboard.press('Enter');
-  } else {
-    log.info('login', 'Submit clicado');
-  }
+  const POST_RESUBMIT_TIMEOUT_MS = 9000;
 
-  // Poll: modal SIM / saída do login
+  // Poll: modal SIM → re-submit → saída real do login
   const deadline = Date.now() + config.navTimeoutMs;
   while (Date.now() < deadline) {
-    await dismissAlreadyConnectedModal(page);
+    const dismissed = await dismissAlreadyConnectedModal(page);
+
+    if (dismissed) {
+      // SIM só desconecta a outra sessão; formulário volta e precisa re-submeter
+      if (isLoginUrl(page.url()) || (await loginFormVisible(page))) {
+        log.info(
+          'login',
+          'Modal sumiu mas ainda em /access/login — re-submetendo (seta vermelha)',
+          { url: page.url() },
+        );
+        await sleep(800);
+        await clickLoginSubmit(page);
+        log.info('login', 'Submit clicado (2ª tentativa, após SIM)');
+
+        const left = await waitUntilLeftLogin(page, POST_RESUBMIT_TIMEOUT_MS);
+        if (left.ok) {
+          log.info('login', 'Login concluído após re-submit', {
+            reason: left.reason,
+            url: page.url(),
+          });
+          return;
+        }
+        if (left.reason === 'modal_reappeared') {
+          log.warn('login', 'Modal reapareceu após re-submit — tentando de novo');
+          continue;
+        }
+        log.warn('login', 'Ainda em /access/login após re-submit', {
+          reason: left.reason,
+          url: page.url(),
+          timeoutMs: POST_RESUBMIT_TIMEOUT_MS,
+        });
+        // segue o loop / timeout final como falha real
+      }
+    }
+
     if (await isLoggedIn(page)) {
       log.info('login', 'Login concluído', { url: page.url() });
       return;
@@ -525,7 +599,7 @@ export async function login(page: Page): Promise<void> {
   await dumpDebug(page, 'login-timeout');
   throw new Error(
     `login: timeout aguardando sair da tela de login (url=${page.url()}). ` +
-      'Possíveis causas: credenciais inválidas, modal bloqueando, ou mudança no fluxo Saipos. ' +
+      'Possíveis causas: credenciais inválidas, modal bloqueando, ou re-submit após SIM falhou. ' +
       'Veja screenshot em logs/.',
   );
 }
