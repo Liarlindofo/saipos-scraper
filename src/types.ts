@@ -20,6 +20,11 @@ export type FieldValues = Record<string, number | string | null>;
 export interface ScrapeResult {
   porLoja: Record<string, FieldValues>;
   consolidado: FieldValues | null;
+  /**
+   * Slugs em que a extração veio toda null após retry (falha de captura,
+   * não "dia sem movimento"). O n8n deve tratar essas lojas como alerta.
+   */
+  falhasExtracao?: string[];
 }
 
 export interface StoreDef {

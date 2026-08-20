@@ -12,11 +12,61 @@ import { login } from './modules/login.js';
 import { setDateRange } from './modules/setDateRange.js';
 import { switchStore } from './modules/switchStore.js';
 import { resolveStores } from './stores.js';
-import type { ScrapeRequest, ScrapeResult, FieldValues } from './types.js';
+import type { CampoRequest, ScrapeRequest, ScrapeResult, FieldValues } from './types.js';
+import { dumpDebugScreenshot } from './utils/debugScreenshot.js';
 import { log } from './utils/logger.js';
 
 /** Mutex simples — um scrape por vez (mesmo browser/perfil). */
 let scrapeLock: Promise<void> = Promise.resolve();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** True se TODOS os campos pedidos vieram null (captura inválida, não dia zerado). */
+function allFieldsNull(values: FieldValues, campos: CampoRequest[]): boolean {
+  if (campos.length === 0) return false;
+  return campos.every((c) => values[c.key] === null || values[c.key] === undefined);
+}
+
+/**
+ * Extrai campos; se tudo vier null, faz 1 retry de leitura do DOM
+ * (sem novo Buscar). Se ainda null, screenshot de debug.
+ */
+async function extractWithNullRetry(
+  page: import('puppeteer-core').Page,
+  campos: CampoRequest[],
+  storeSlug: string,
+): Promise<{ values: FieldValues; falhou: boolean }> {
+  let values = await extractFields(page, campos);
+
+  if (!allFieldsNull(values, campos)) {
+    return { values, falhou: false };
+  }
+
+  log.warn(
+    `loja:${storeSlug}`,
+    'Extração veio TODA null — aguardando e relendo o DOM (retry)',
+  );
+  await sleep(1500);
+  values = await extractFields(page, campos);
+
+  if (!allFieldsNull(values, campos)) {
+    log.info(`loja:${storeSlug}`, 'Retry de extração recuperou dados');
+    return { values, falhou: false };
+  }
+
+  log.error(
+    `loja:${storeSlug}`,
+    'Extração ainda toda null após retry — screenshot de debug',
+  );
+  await dumpDebugScreenshot(page, `extraction-all-null-${storeSlug}`, {
+    storeSlug,
+    url: page.url(),
+  });
+
+  return { values, falhou: true };
+}
 
 export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
   assertCredentials();
@@ -58,6 +108,7 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
       await login(page);
 
       const porLojaRaw: Record<string, FieldValues> = {};
+      const falhasExtracao: string[] = [];
 
       for (const store of stores) {
         const step = `loja:${store.slug}`;
@@ -73,8 +124,13 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
           await setDateRange(page, req.data, req.data);
           await clickBuscar(page);
 
-          const values = await extractFields(page, scrapeCampos);
+          const { values, falhou } = await extractWithNullRetry(
+            page,
+            scrapeCampos,
+            store.slug,
+          );
           porLojaRaw[store.slug] = values;
+          if (falhou) falhasExtracao.push(store.slug);
 
           log.info(step, 'OK', pickRequestedKeys(values, req.campos));
         } catch (err) {
@@ -93,8 +149,13 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
             await goToSalesByPeriodReport(page);
             await setDateRange(page, req.data, req.data);
             await clickBuscar(page);
-            const values = await extractFields(page, scrapeCampos);
+            const { values, falhou } = await extractWithNullRetry(
+              page,
+              scrapeCampos,
+              store.slug,
+            );
             porLojaRaw[store.slug] = values;
+            if (falhou) falhasExtracao.push(store.slug);
             log.info(step, 'OK após retry', pickRequestedKeys(values, req.campos));
           } else {
             throw new Error(`[${store.slug}] ${msg}`);
@@ -114,11 +175,17 @@ export async function scrapeReport(req: ScrapeRequest): Promise<ScrapeResult> {
         log.info('scrapeReport', 'Consolidado', consolidado);
       }
 
-      if (req.escopoLoja === 'CONSOLIDADO') {
-        return { porLoja: {}, consolidado };
+      if (falhasExtracao.length > 0) {
+        log.warn('scrapeReport', 'Lojas com falha de extração (tudo null)', {
+          falhasExtracao,
+        });
       }
 
-      return { porLoja, consolidado };
+      if (req.escopoLoja === 'CONSOLIDADO') {
+        return { porLoja: {}, consolidado, falhasExtracao };
+      }
+
+      return { porLoja, consolidado, falhasExtracao };
     });
   } catch (err) {
     // Em erro grave, fecha o browser para não acumular páginas/processos órfãos
